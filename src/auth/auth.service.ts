@@ -12,8 +12,11 @@ import { TooManyRequestsException } from './exceptions/too-many-requests.excepti
 import { JwtService } from '@nestjs/jwt';
 import { generateSecureKey } from '@/common/utils/generate-key.util';
 import { ACCESS_TOKEN_TTL, REFRESH_TOKEN_TTL } from './constants/limits';
-import { RefreshTokenDto } from './dto/refresh-token.dto';
+import { TokenDto } from './dto/refresh-token.dto';
 import { ConfigService } from '@nestjs/config';
+import { InjectPinoLogger, PinoLogger } from 'nestjs-pino';
+import { RegisterDto } from './dto/register.dto';
+import { LoginDto } from './dto/login.dto';
 
 @Injectable()
 export class AuthService {
@@ -23,27 +26,40 @@ export class AuthService {
     private readonly jwtService: JwtService,
     private readonly refreshTokenService: RefreshTokenService,
     private readonly configService: ConfigService,
+    @InjectPinoLogger(AuthService.name)
+    private readonly logger: PinoLogger,
   ) {}
 
-  public async registerUser(email: string, password: string): Promise<void> {
-    const existingUser = await this.userService.getByEmail(email);
+  public async registerUser(dto: RegisterDto): Promise<number> {
+    const existingUser = await this.userService.getByEmail(dto.email);
     if (existingUser) {
+      this.logger.warn(`Пользователь с email: ${dto.email} уже существует`);
       throw new BadRequestException(
         'Пользователь с таким email уже существует',
       );
     }
 
-    await this.userService.create(email, password);
+    const hashedPassword = await this.hashPassword(dto.password);
+    dto.password = hashedPassword;
+
+    const created = await this.userService.create(dto);
+    this.logger.info(
+      `Пользователь с email: ${dto.email} успешно зарегистрирован`,
+    );
+
+    return created;
   }
 
   public async login(
     req: Request,
     res: Response,
-    email: string,
-    password: string,
+    dto: LoginDto,
   ): Promise<User> {
     const ip = req.ip;
+    const { email, password } = dto;
+
     if (ip === undefined) {
+      this.logger.error('IP адрес не определен при попытке входа');
       throw new BadRequestException('IP адрес не определен');
     }
 
@@ -54,22 +70,30 @@ export class AuthService {
 
     const user = await this.userService.getByEmail(email);
     if (!user) {
+      this.logger.error(`Пользователь с email: ${email} не найден. IP: ${ip}`);
       await this.rateLimitService.incrementLoginAttempts(ip);
       throw new BadRequestException('Неверный email или пароль');
     }
     const isPasswordValid = await this.validatePassword(user, password);
     if (!isPasswordValid) {
+      this.logger.error(
+        `Неверный пароль для пользователя с email: ${email}. IP: ${ip}`,
+      );
       await this.rateLimitService.incrementLoginAttempts(ip);
       throw new BadRequestException(VALIDATION.LOGIN.ERROR_MESSAGE);
     }
     await this.rateLimitService.resetLoginAttempts(ip);
 
     if (user.isBlocked) {
+      this.logger.warn(
+        `Попытка входа заблокированного пользователя с email: ${email}. IP: ${ip}`,
+      );
       throw new BadRequestException('Пользователь заблокирован');
     }
     const session = generateSecureKey(32);
     const accessToken = await this.createToken(user, 'access', session);
     const refreshToken = await this.createToken(user, 'refresh', session);
+    const csrfToken = generateSecureKey(32);
 
     await this.refreshTokenService.save(
       user.id,
@@ -80,6 +104,11 @@ export class AuthService {
 
     await this.setTokenCookie(res, accessToken, 'access');
     await this.setTokenCookie(res, refreshToken, 'refresh');
+    await this.setTokenCookie(res, csrfToken, 'csrf');
+
+    this.logger.info(
+      `Пользователь с email: ${dto.email} успешно вошел в систему. IP: ${ip}`,
+    );
 
     return user;
   }
@@ -87,19 +116,29 @@ export class AuthService {
   public async logout(req: Request, res: Response): Promise<void> {
     const refreshToken = req.cookies['refresh_token'];
     if (refreshToken === undefined) {
+      this.logger.error('Отсутствует refresh token в cookies при выходе');
       throw new BadRequestException('Отсутствует refresh token в cookies');
     }
 
-    let payload: RefreshTokenDto;
+    let payload: TokenDto;
     try {
-      payload = this.jwtService.verify(refreshToken);
-    } catch {
+      payload = await this.jwtService.verifyAsync<TokenDto>(refreshToken, {
+        secret: this.configService.getOrThrow('JWT_SECRET'),
+        algorithms: [this.configService.getOrThrow('JWT_ALGORITHM')],
+        audience: this.configService.getOrThrow('JWT_AUDIENCE'),
+        issuer: this.configService.getOrThrow('JWT_ISSUER'),
+      });
+    } catch (error) {
+      this.logger.error('Неверный refresh token при выходе. Ошибка:', {
+        error,
+      });
       throw new BadRequestException('Неверный refresh token');
     }
     const userId = payload.sub;
     const sessionId = payload.session;
 
     if (!userId || !sessionId) {
+      this.logger.error('Неверный формат токена при выходе');
       throw new BadRequestException('Неверный формат токена');
     }
 
@@ -114,18 +153,31 @@ export class AuthService {
       secure: this.configService.getOrThrow('NODE_ENV') === 'production',
       sameSite: 'lax',
     });
+    res.clearCookie('csrf_token', {
+      httpOnly: false,
+      secure: this.configService.getOrThrow('NODE_ENV') === 'production',
+      sameSite: 'lax',
+    });
+
+    this.logger.info(
+      `Пользователь с ID: ${userId} успешно вышел из системы, session: ${sessionId}`,
+    );
   }
 
   public async refresh(req: Request, res: Response): Promise<void> {
     const refreshToken = req.cookies['refresh_token'];
     if (refreshToken === undefined) {
+      this.logger.error(
+        'Отсутствует refresh token в cookies при обновлении токена',
+      );
       throw new BadRequestException('Отсутствует refresh token в cookies');
     }
 
-    let payload: RefreshTokenDto;
+    let payload: TokenDto;
     try {
-      payload = this.jwtService.verify(refreshToken);
+      payload = await this.jwtService.verifyAsync<TokenDto>(refreshToken);
     } catch {
+      this.logger.error('Неверный payload при обновлении refresh токена');
       throw new BadRequestException('Неверный refresh token');
     }
     const userId = payload.sub;
@@ -145,6 +197,9 @@ export class AuthService {
       sessionId,
     );
     if (isRateLimited) {
+      this.logger.error(
+        `Слишком много попыток обновления токена для пользователя с ID: ${userId} и session: ${sessionId}`,
+      );
       throw new TooManyRequestsException();
     }
 
@@ -158,6 +213,7 @@ export class AuthService {
 
     const accessToken = await this.createToken(user, 'access', sessionId);
     const newRefreshToken = await this.createToken(user, 'refresh', sessionId);
+    const csrfToken = generateSecureKey(32);
 
     await this.refreshTokenService.save(
       user.id,
@@ -170,6 +226,11 @@ export class AuthService {
 
     await this.setTokenCookie(res, accessToken, 'access');
     await this.setTokenCookie(res, newRefreshToken, 'refresh');
+    await this.setTokenCookie(res, csrfToken, 'csrf');
+
+    this.logger.info(
+      `Пользователь с ID: ${userId} успешно обновил токены, session: ${sessionId}`,
+    );
 
     res.status(204).send();
   }
@@ -186,8 +247,12 @@ export class AuthService {
     if (email !== undefined && email !== user.email) {
       const existingUser = await this.userService.getByEmail(email);
       if (existingUser && existingUser.id !== id) {
+        this.logger.warn(
+          `Данный email: ${email} уже используется другим пользователем`,
+        );
+
         throw new BadRequestException(
-          'Пользователь с таким email уже существует',
+          'Данный email уже используется другим пользователем',
         );
       }
       updatedFields.email = email;
@@ -204,15 +269,19 @@ export class AuthService {
     }
 
     const updatedUser = await this.userService.update(id, updatedFields);
+
+    this.logger.info(
+      `Пользователь с ID: ${id} успешно обновлен, изменены поля: ${Object.keys(updatedFields).join(', ')}`,
+    );
     return updatedUser;
   }
 
   public async blockUser(id: number): Promise<User> {
-    return this.userService.block(id);
+    return await this.userService.block(id);
   }
 
   public async unblockUser(id: number): Promise<User> {
-    return this.userService.unblock(id);
+    return await this.userService.unblock(id);
   }
 
   private async hashPassword(password: string): Promise<string> {
@@ -231,28 +300,36 @@ export class AuthService {
     type: 'access' | 'refresh',
     session: string,
   ): Promise<string> {
-    return this.jwtService.signAsync(
+    return await this.jwtService.signAsync(
       {
         sub: user.id,
         role: user.role,
         session,
         tokenType: type,
       },
-      { expiresIn: type === 'access' ? '15m' : '7d' },
+      {
+        expiresIn: type === 'access' ? '15m' : '7d',
+        secret: this.configService.getOrThrow('JWT_SECRET'),
+        algorithm: this.configService.getOrThrow('JWT_ALGORITHM'),
+        audience: this.configService.getOrThrow('JWT_AUDIENCE'),
+        issuer: this.configService.getOrThrow('JWT_ISSUER'),
+      },
     );
   }
 
   private async setTokenCookie(
     res: Response,
     token: string,
-    type: 'access' | 'refresh',
+    type: 'access' | 'refresh' | 'csrf',
   ): Promise<void> {
     const cookieOptions: CookieOptions = {
-      httpOnly: true,
+      httpOnly: type !== 'csrf' ? true : false,
       secure: this.configService.getOrThrow('NODE_ENV') === 'production',
       sameSite: 'lax',
       maxAge:
-        type === 'access' ? ACCESS_TOKEN_TTL * 1000 : REFRESH_TOKEN_TTL * 1000,
+        type === 'access' || type === 'csrf'
+          ? ACCESS_TOKEN_TTL * 1000
+          : REFRESH_TOKEN_TTL * 1000,
     };
     res.cookie(`${type}_token`, token, cookieOptions);
   }

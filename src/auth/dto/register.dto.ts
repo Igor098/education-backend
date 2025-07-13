@@ -1,32 +1,35 @@
 import { VALIDATION } from '@/common/constants/validation';
 import { IsPasswordMatchingConstraint } from '@/common/decorators/is-password-matching-constraint.decorator';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import {
   IsEmail,
   IsNotEmpty,
   IsOptional,
   IsString,
   Matches,
-  Max,
-  Min,
+  MaxLength,
+  MinLength,
   Validate,
 } from 'class-validator';
 
 export class RegisterDto {
   @IsEmail({}, { message: VALIDATION.EMAIL.VALIDATION_MESSAGE })
   @IsNotEmpty({ message: VALIDATION.EMAIL.NULLABLE_MESSAGE })
+  @ApiProperty({ type: String, required: true, default: '8eDfA@example.com' })
   email: string;
 
   @IsString({ message: VALIDATION.PASSWORD.STRING_MESSAGE })
   @IsNotEmpty({ message: VALIDATION.PASSWORD.NULLABLE_MESSAGE })
-  @Min(VALIDATION.PASSWORD.LENGTH.MIN, {
+  @MinLength(VALIDATION.PASSWORD.LENGTH.MIN, {
     message: VALIDATION.PASSWORD.MIN_LENGTH_MESSAGE,
   })
-  @Max(VALIDATION.PASSWORD.LENGTH.MAX, {
+  @MaxLength(VALIDATION.PASSWORD.LENGTH.MAX, {
     message: VALIDATION.PASSWORD.MAX_LENGTH_MESSAGE,
   })
   @Matches(new RegExp(VALIDATION.PASSWORD.REGEXP), {
     message: VALIDATION.PASSWORD.VALIDATION_MESSAGE,
   })
+  @ApiProperty({ type: String, required: true, default: 'SecretPassword123$' })
   password: string;
 
   @IsString({ message: VALIDATION.CONFIRM_PASSWORD.STRING_MESSAGE })
@@ -34,15 +37,17 @@ export class RegisterDto {
   @Validate(IsPasswordMatchingConstraint, {
     message: VALIDATION.CONFIRM_PASSWORD.VALIDATION_MESSAGE,
   })
+  @ApiProperty({ type: String, required: true, default: 'SecretPassword123$' })
   confirmPassword: string;
 
   @IsOptional()
-  @Min(VALIDATION.NAME.LENGTH.MIN, {
+  @MinLength(VALIDATION.NAME.LENGTH.MIN, {
     message: VALIDATION.NAME.MIN_LENGTH_MESSAGE,
   })
-  @Max(VALIDATION.NAME.LENGTH.MAX, {
+  @MaxLength(VALIDATION.NAME.LENGTH.MAX, {
     message: VALIDATION.NAME.MAX_LENGTH_MESSAGE,
   })
   @IsString({ message: VALIDATION.NAME.STRING_MESSAGE })
+  @ApiPropertyOptional({ type: String, required: false, default: 'John Doe' })
   name?: string;
 }

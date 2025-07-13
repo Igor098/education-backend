@@ -27,6 +27,9 @@ export class User {
   @Column({ type: 'boolean', name: 'is_active', default: true })
   isActive: boolean;
 
+  @Column({ type: 'boolean', name: 'is_verified', default: false })
+  isVerified: boolean;
+
   @Column({ type: 'boolean', name: 'is_blocked', default: false })
   isBlocked: boolean;
 
